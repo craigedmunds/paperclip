@@ -35,10 +35,9 @@ export async function testEnvironment(
 
   // If we have required fields, try to reach the server
   if (url && directory) {
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), 10000);
     try {
-      const controller = new AbortController();
-      const timer = setTimeout(() => controller.abort(), 10000);
-
       const res = await fetch(`${url}/project`, {
         signal: controller.signal,
       });
