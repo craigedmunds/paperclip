@@ -1,6 +1,12 @@
 import type { ServerAdapterModule } from "./types.js";
 import { getAdapterSessionManagement } from "@paperclipai/adapter-utils";
 import {
+  execute as claudeK8sExecute,
+  testEnvironment as claudeK8sTestEnvironment,
+  sessionCodec as claudeK8sSessionCodec,
+} from "@paperclipai/adapter-claude-k8s/server";
+import { agentConfigurationDoc as claudeK8sAgentConfigurationDoc, models as claudeK8sModels } from "@paperclipai/adapter-claude-k8s";
+import {
   execute as claudeExecute,
   listClaudeSkills,
   syncClaudeSkills,
@@ -206,9 +212,20 @@ const hermesLocalAdapter: ServerAdapterModule = {
   detectModel: () => detectModelFromHermes(),
 };
 
+const claudeK8sAdapter: ServerAdapterModule = {
+  type: "claude_k8s",
+  execute: claudeK8sExecute,
+  testEnvironment: claudeK8sTestEnvironment,
+  sessionCodec: claudeK8sSessionCodec,
+  models: claudeK8sModels,
+  supportsLocalAgentJwt: true,
+  agentConfigurationDoc: claudeK8sAgentConfigurationDoc,
+};
+
 const adaptersByType = new Map<string, ServerAdapterModule>(
   [
     claudeLocalAdapter,
+    claudeK8sAdapter,
     codexLocalAdapter,
     openCodeLocalAdapter,
     piLocalAdapter,
