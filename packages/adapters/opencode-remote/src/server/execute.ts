@@ -11,7 +11,6 @@ import {
   buildPaperclipEnv,
   redactEnvForLogs,
   renderTemplate,
-  renderPaperclipWakePrompt,
   joinPromptSections,
 } from "@paperclipai/adapter-utils/server-utils";
 import { parseOpenCodeResponse, isOpenCodeSessionNotFound } from "./parse.js";
@@ -168,24 +167,22 @@ export async function execute(
     context,
   };
 
-  // Build structured wake prompt (Resume Delta) — same architecture as claude_local.
-  // The wake prompt provides issue context, latest comments, and delta info.
-  // On resumed sessions with wake context, the template prompt is suppressed (agent
-  // already has full context).  On fresh runs (manual "run heartbeat"), both the
-  // wake prompt AND the template prompt are included so the agent always has identity.
+  // Follow the standard adapter prompt pattern: render the template (which carries
+  // all wake/context data via {{context.*}} placeholders) and join with bootstrap +
+  // handoff sections.  No special wake prompt handling needed — the platform injects
+  // wake data through the template configured per-agent.
   const runtimeSessionParams = parseObject(runtime.sessionParams);
   const hasExistingSession = asString(runtimeSessionParams.sessionId, "").length > 0;
-  const wakePrompt = renderPaperclipWakePrompt(context.paperclipWake, {
-    resumedSession: hasExistingSession,
-  });
-  const shouldSuppressTemplate = hasExistingSession && wakePrompt.length > 0;
-  const renderedPrompt = shouldSuppressTemplate
-    ? ""
-    : renderTemplate(promptTemplate, templateData);
+  const bootstrapPromptTemplate = asString(config.bootstrapPromptTemplate, "");
+  const renderedPrompt = renderTemplate(promptTemplate, templateData);
+  const renderedBootstrapPrompt =
+    !hasExistingSession && bootstrapPromptTemplate.trim().length > 0
+      ? renderTemplate(bootstrapPromptTemplate, templateData).trim()
+      : "";
   const sessionHandoffNote = asString(context.paperclipSessionHandoffMarkdown, "").trim();
   const prompt = joinPromptSections([
     instructionsPrefix,
-    wakePrompt,
+    renderedBootstrapPrompt,
     sessionHandoffNote,
     renderedPrompt,
   ]);
