@@ -11,6 +11,8 @@ import {
   buildPaperclipEnv,
   redactEnvForLogs,
   renderTemplate,
+  renderPaperclipWakePrompt,
+  stringifyPaperclipWakePayload,
   joinPromptSections,
 } from "@paperclipai/adapter-utils/server-utils";
 import { parseOpenCodeResponse, isOpenCodeSessionNotFound } from "./parse.js";
@@ -93,7 +95,7 @@ async function fetchJson<T>(
 export async function execute(
   ctx: AdapterExecutionContext,
 ): Promise<AdapterExecutionResult> {
-  const { runId, agent, runtime, config, context, onLog, onMeta, authToken: _authToken } =
+  const { runId, agent, runtime, config, context, onLog, onMeta, authToken } =
     ctx;
 
   const url = asString(config.url, "").replace(/\/+$/, "");
@@ -142,9 +144,50 @@ export async function execute(
     }
   }
 
-  // Build Paperclip env context for template rendering
+  // Build Paperclip env — same wake vars as opencode_local so the remote agent
+  // has full context even though we can't set process env vars remotely.
+  const envConfig = parseObject(config.env);
+  const hasExplicitApiKey =
+    typeof envConfig.PAPERCLIP_API_KEY === "string" && envConfig.PAPERCLIP_API_KEY.trim().length > 0;
   const env: Record<string, string> = { ...buildPaperclipEnv(agent) };
   env.PAPERCLIP_RUN_ID = runId;
+  const wakeTaskId =
+    (typeof context.taskId === "string" && context.taskId.trim().length > 0 && context.taskId.trim()) ||
+    (typeof context.issueId === "string" && context.issueId.trim().length > 0 && context.issueId.trim()) ||
+    null;
+  const wakeReason =
+    typeof context.wakeReason === "string" && context.wakeReason.trim().length > 0
+      ? context.wakeReason.trim()
+      : null;
+  const wakeCommentId =
+    (typeof context.wakeCommentId === "string" && context.wakeCommentId.trim().length > 0 && context.wakeCommentId.trim()) ||
+    (typeof context.commentId === "string" && context.commentId.trim().length > 0 && context.commentId.trim()) ||
+    null;
+  const approvalId =
+    typeof context.approvalId === "string" && context.approvalId.trim().length > 0
+      ? context.approvalId.trim()
+      : null;
+  const approvalStatus =
+    typeof context.approvalStatus === "string" && context.approvalStatus.trim().length > 0
+      ? context.approvalStatus.trim()
+      : null;
+  const linkedIssueIds = Array.isArray(context.issueIds)
+    ? context.issueIds.filter((value): value is string => typeof value === "string" && value.trim().length > 0)
+    : [];
+  const wakePayloadJson = stringifyPaperclipWakePayload(context.paperclipWake);
+  if (wakeTaskId) env.PAPERCLIP_TASK_ID = wakeTaskId;
+  if (wakeReason) env.PAPERCLIP_WAKE_REASON = wakeReason;
+  if (wakeCommentId) env.PAPERCLIP_WAKE_COMMENT_ID = wakeCommentId;
+  if (approvalId) env.PAPERCLIP_APPROVAL_ID = approvalId;
+  if (approvalStatus) env.PAPERCLIP_APPROVAL_STATUS = approvalStatus;
+  if (linkedIssueIds.length > 0) env.PAPERCLIP_LINKED_ISSUE_IDS = linkedIssueIds.join(",");
+  if (wakePayloadJson) env.PAPERCLIP_WAKE_PAYLOAD_JSON = wakePayloadJson;
+  for (const [key, value] of Object.entries(envConfig)) {
+    if (typeof value === "string") env[key] = value;
+  }
+  if (!hasExplicitApiKey && authToken) {
+    env.PAPERCLIP_API_KEY = authToken;
+  }
 
   const templateData = {
     agentId: agent.id,
@@ -156,23 +199,41 @@ export async function execute(
     context,
   };
 
-  // Follow the standard adapter prompt pattern: render the template (which carries
-  // all wake/context data via {{context.*}} placeholders) and join with bootstrap +
-  // handoff sections.  No special wake prompt handling needed — the platform injects
-  // wake data through the template configured per-agent.
+  // Build prompt following the same pattern as opencode_local:
+  // instructions + bootstrap + wake prompt + handoff + rendered template.
+  // Since this is a remote adapter, we also inject env vars into the prompt
+  // so the agent has API access (PAPERCLIP_API_KEY, etc.).
   const runtimeSessionParams = parseObject(runtime.sessionParams);
   const hasExistingSession = asString(runtimeSessionParams.sessionId, "").length > 0;
   const bootstrapPromptTemplate = asString(config.bootstrapPromptTemplate, "");
-  const renderedPrompt = renderTemplate(promptTemplate, templateData);
   const renderedBootstrapPrompt =
     !hasExistingSession && bootstrapPromptTemplate.trim().length > 0
       ? renderTemplate(bootstrapPromptTemplate, templateData).trim()
       : "";
+  const wakePrompt = renderPaperclipWakePrompt(context.paperclipWake, {
+    resumedSession: hasExistingSession,
+  });
+  const shouldUseResumeDeltaPrompt = hasExistingSession && wakePrompt.length > 0;
+  const renderedPrompt = shouldUseResumeDeltaPrompt
+    ? ""
+    : renderTemplate(promptTemplate, templateData);
   const sessionHandoffNote = asString(context.paperclipSessionHandoffMarkdown, "").trim();
+
+  // Inject env vars into the prompt so the remote agent has API access.
+  // Local adapters set these as process env vars; remote adapters must pass them in-band.
+  const envEntries = Object.entries(env).filter(
+    ([key]) => key.startsWith("PAPERCLIP_"),
+  );
+  const envSection = envEntries.length > 0
+    ? `## Paperclip Environment\n\nThe following environment variables are provided for this run. Use PAPERCLIP_API_KEY to authenticate API calls to PAPERCLIP_API_URL.\n\n${envEntries.map(([k, v]) => `${k}=${v}`).join("\n")}`
+    : "";
+
   const prompt = joinPromptSections([
     instructionsPrefix,
     renderedBootstrapPrompt,
+    wakePrompt,
     sessionHandoffNote,
+    envSection,
     renderedPrompt,
   ]);
 
