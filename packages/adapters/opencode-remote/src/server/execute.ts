@@ -194,14 +194,24 @@ export async function execute(
 
     // Create a new session if not resuming
     if (!sessionId) {
-      const taskKey =
-        runtime.taskKey ??
-        (typeof context.issueIdentifier === "string"
-          ? context.issueIdentifier
-          : null);
-      const sessionTitle = taskKey
-        ? `Paperclip: ${taskKey}`
-        : `Paperclip run ${runId.slice(0, 8)}`;
+      // Build a descriptive session title: "AgentName: TEC-29 — Task title"
+      const wakePayload = parseObject(context.paperclipWakePayload);
+      const wakeIssue = parseObject(wakePayload.issue);
+      const issueIdentifier =
+        asString(context.issueIdentifier, "") ||
+        asString(wakeIssue.identifier, "") ||
+        runtime.taskKey ||
+        null;
+      const issueTitle =
+        asString(context.issueTitle, "") ||
+        asString(wakeIssue.title, "") ||
+        "";
+      const agentLabel = agent.name || "Agent";
+      const sessionTitle = issueIdentifier
+        ? issueTitle
+          ? `${agentLabel}: ${issueIdentifier} — ${issueTitle}`
+          : `${agentLabel}: ${issueIdentifier}`
+        : `${agentLabel}: run ${runId.slice(0, 8)}`;
 
       await onLog(
         "stderr",
