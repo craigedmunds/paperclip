@@ -17,13 +17,6 @@ import {
 } from "@paperclipai/adapter-utils/server-utils";
 import { parseOpenCodeResponse, isOpenCodeSessionNotFound } from "./parse.js";
 
-// Node.js fetch (undici) defaults to bodyTimeout=300s.  When the caller wants
-// "no timeout" (timeoutMs=0), we still need an AbortController with a large
-// ceiling so that the explicit signal overrides undici's internal default.
-// 1 hour is generous; the adapter-level or Paperclip-level timeout should be
-// the real limit, not an HTTP library default.
-const MAX_FALLBACK_TIMEOUT_MS = 60 * 60 * 1000; // 1 hour
-
 function isAbortError(err: unknown): boolean {
   return (
     (err instanceof DOMException && err.name === "AbortError") ||
@@ -76,14 +69,10 @@ async function fetchJson<T>(
   opts: RequestInit & { timeoutMs?: number },
 ): Promise<{ ok: boolean; status: number; data: T; raw: string }> {
   const controller = new AbortController();
-  // Always set an AbortController timeout so that the explicit signal
-  // overrides Node.js/undici's default 300s body timeout.  When the caller
-  // passes timeoutMs=0 (no limit), use a generous fallback ceiling.
-  const effectiveTimeout =
+  const timer =
     opts.timeoutMs && opts.timeoutMs > 0
-      ? opts.timeoutMs
-      : MAX_FALLBACK_TIMEOUT_MS;
-  const timer = setTimeout(() => controller.abort(), effectiveTimeout);
+      ? setTimeout(() => controller.abort(), opts.timeoutMs)
+      : null;
 
   try {
     const res = await fetch(url, {
@@ -99,7 +88,7 @@ async function fetchJson<T>(
     }
     return { ok: res.ok, status: res.status, data, raw };
   } finally {
-    clearTimeout(timer);
+    if (timer) clearTimeout(timer);
   }
 }
 
