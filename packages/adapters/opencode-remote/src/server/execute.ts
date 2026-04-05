@@ -17,13 +17,6 @@ import {
 } from "@paperclipai/adapter-utils/server-utils";
 import { parseOpenCodeResponse, isOpenCodeSessionNotFound } from "./parse.js";
 
-// Node.js fetch (undici) defaults to bodyTimeout=300s.  When the caller wants
-// "no timeout" (timeoutMs=0), we still need an AbortController with a large
-// ceiling so that the explicit signal overrides undici's internal default.
-// 1 hour is generous; the adapter-level or Paperclip-level timeout should be
-// the real limit, not an HTTP library default.
-const MAX_FALLBACK_TIMEOUT_MS = 60 * 60 * 1000; // 1 hour
-
 function isAbortError(err: unknown): boolean {
   return (
     (err instanceof DOMException && err.name === "AbortError") ||
@@ -76,14 +69,10 @@ async function fetchJson<T>(
   opts: RequestInit & { timeoutMs?: number },
 ): Promise<{ ok: boolean; status: number; data: T; raw: string }> {
   const controller = new AbortController();
-  // Always set an AbortController timeout so that the explicit signal
-  // overrides Node.js/undici's default 300s body timeout.  When the caller
-  // passes timeoutMs=0 (no limit), use a generous fallback ceiling.
-  const effectiveTimeout =
+  const timer =
     opts.timeoutMs && opts.timeoutMs > 0
-      ? opts.timeoutMs
-      : MAX_FALLBACK_TIMEOUT_MS;
-  const timer = setTimeout(() => controller.abort(), effectiveTimeout);
+      ? setTimeout(() => controller.abort(), opts.timeoutMs)
+      : null;
 
   try {
     const res = await fetch(url, {
@@ -99,7 +88,7 @@ async function fetchJson<T>(
     }
     return { ok: res.ok, status: res.status, data, raw };
   } finally {
-    clearTimeout(timer);
+    if (timer) clearTimeout(timer);
   }
 }
 
@@ -316,7 +305,15 @@ export async function execute(
           {
             method: "POST",
             headers: { "content-type": "application/json" },
-            body: JSON.stringify({ title: sessionTitle }),
+            body: JSON.stringify({
+              title: sessionTitle,
+              // Grant session-scoped permissions so the agent can run tools
+              // without interactive prompts (same as opencode_local's
+              // dangerouslySkipPermissions runtime config injection).
+              permission: [
+                { permission: "external_directory", pattern: "*", action: "allow" },
+              ],
+            }),
             timeoutMs: 30000,
           },
         );
@@ -389,6 +386,18 @@ export async function execute(
           error: `Message send failed: HTTP ${msgRes.status} — ${msgRes.raw.slice(0, 500)}`,
           timedOut: false,
           raw: msgRes.raw,
+        };
+      }
+
+      // OpenCode returns 200 with empty body when the session doesn't exist.
+      // Treat this as an error so the retry logic can create a fresh session.
+      if (!msgRes.raw.trim()) {
+        return {
+          sessionId,
+          response: null,
+          error: `Empty response from OpenCode (session may not exist)`,
+          timedOut: false,
+          raw: "",
         };
       }
 
@@ -490,13 +499,14 @@ export async function execute(
   const sessionIdToResume = canResume ? runtimeSessionId : null;
   const initial = await runAttempt(sessionIdToResume);
 
-  // If session resume failed with "not found", retry with fresh session
-  if (
+  // If session resume failed with "not found" or empty response, retry with fresh session.
+  // OpenCode may return 200 with empty body for non-existent sessions.
+  const shouldRetryWithFreshSession =
     sessionIdToResume &&
     initial.error &&
     !initial.timedOut &&
-    isOpenCodeSessionNotFound(initial.raw)
-  ) {
+    (isOpenCodeSessionNotFound(initial.raw) || !initial.raw.trim());
+  if (shouldRetryWithFreshSession) {
     await onLog(
       "stderr",
       `[paperclip] OpenCode session "${sessionIdToResume}" not found; retrying with a fresh session.\n`,
