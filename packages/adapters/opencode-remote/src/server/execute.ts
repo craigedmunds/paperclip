@@ -158,15 +158,17 @@ export async function execute(
   };
 
   // Build structured wake prompt (Resume Delta) — same architecture as claude_local.
-  // When resuming a session, the wake prompt replaces the generic template prompt
-  // so the agent gets the full issue context, latest comments, and delta info.
+  // The wake prompt provides issue context, latest comments, and delta info.
+  // On resumed sessions with wake context, the template prompt is suppressed (agent
+  // already has full context).  On fresh runs (manual "run heartbeat"), both the
+  // wake prompt AND the template prompt are included so the agent always has identity.
   const runtimeSessionParams = parseObject(runtime.sessionParams);
   const hasExistingSession = asString(runtimeSessionParams.sessionId, "").length > 0;
   const wakePrompt = renderPaperclipWakePrompt(context.paperclipWake, {
     resumedSession: hasExistingSession,
   });
-  const shouldUseWakePrompt = wakePrompt.length > 0;
-  const renderedPrompt = shouldUseWakePrompt
+  const shouldSuppressTemplate = hasExistingSession && wakePrompt.length > 0;
+  const renderedPrompt = shouldSuppressTemplate
     ? ""
     : renderTemplate(promptTemplate, templateData);
   const sessionHandoffNote = asString(context.paperclipSessionHandoffMarkdown, "").trim();
