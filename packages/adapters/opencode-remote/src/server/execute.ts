@@ -11,6 +11,8 @@ import {
   buildPaperclipEnv,
   redactEnvForLogs,
   renderTemplate,
+  renderPaperclipWakePrompt,
+  joinPromptSections,
 } from "@paperclipai/adapter-utils/server-utils";
 import { parseOpenCodeResponse, isOpenCodeSessionNotFound } from "./parse.js";
 
@@ -145,7 +147,7 @@ export async function execute(
   const env: Record<string, string> = { ...buildPaperclipEnv(agent) };
   env.PAPERCLIP_RUN_ID = runId;
 
-  const renderedPrompt = renderTemplate(promptTemplate, {
+  const templateData = {
     agentId: agent.id,
     companyId: agent.companyId,
     runId,
@@ -153,8 +155,27 @@ export async function execute(
     agent,
     run: { id: runId, source: "on_demand" },
     context,
+  };
+
+  // Build structured wake prompt (Resume Delta) — same architecture as claude_local.
+  // When resuming a session, the wake prompt replaces the generic template prompt
+  // so the agent gets the full issue context, latest comments, and delta info.
+  const runtimeSessionParams = parseObject(runtime.sessionParams);
+  const hasExistingSession = asString(runtimeSessionParams.sessionId, "").length > 0;
+  const wakePrompt = renderPaperclipWakePrompt(context.paperclipWake, {
+    resumedSession: hasExistingSession,
   });
-  const prompt = `${instructionsPrefix}${renderedPrompt}`;
+  const shouldUseWakePrompt = wakePrompt.length > 0;
+  const renderedPrompt = shouldUseWakePrompt
+    ? ""
+    : renderTemplate(promptTemplate, templateData);
+  const sessionHandoffNote = asString(context.paperclipSessionHandoffMarkdown, "").trim();
+  const prompt = joinPromptSections([
+    instructionsPrefix,
+    wakePrompt,
+    sessionHandoffNote,
+    renderedPrompt,
+  ]);
 
   // Emit invocation metadata
   if (onMeta) {
@@ -174,7 +195,6 @@ export async function execute(
   }
 
   // Session resolution — check for existing session to resume
-  const runtimeSessionParams = parseObject(runtime.sessionParams);
   const runtimeSessionId = asString(runtimeSessionParams.sessionId, "");
   const runtimeSessionDir = asString(runtimeSessionParams.directory, "");
   const canResume =
