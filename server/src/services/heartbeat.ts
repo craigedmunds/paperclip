@@ -2297,6 +2297,14 @@ export function heartbeatService(db: Db) {
           .where(and(eq(issues.id, issueId), eq(issues.companyId, agent.companyId)))
           .then((rows) => rows[0] ?? null)
       : null;
+    // Enrich context with human-readable issue fields so adapters can build
+    // descriptive session titles without additional API calls.
+    if (issueContext?.identifier && !readNonEmptyString(context.issueIdentifier)) {
+      context.issueIdentifier = issueContext.identifier;
+    }
+    if (issueContext?.title && !readNonEmptyString(context.issueTitle)) {
+      context.issueTitle = issueContext.title;
+    }
     const issueAssigneeOverrides =
       issueContext && issueContext.assigneeAgentId === agent.id
         ? parseIssueAssigneeAdapterOverrides(
