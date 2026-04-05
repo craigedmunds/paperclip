@@ -11,15 +11,11 @@ import {
   buildPaperclipEnv,
   redactEnvForLogs,
   renderTemplate,
+  renderPaperclipWakePrompt,
+  stringifyPaperclipWakePayload,
+  joinPromptSections,
 } from "@paperclipai/adapter-utils/server-utils";
 import { parseOpenCodeResponse, isOpenCodeSessionNotFound } from "./parse.js";
-
-// Node.js fetch (undici) defaults to bodyTimeout=300s.  When the caller wants
-// "no timeout" (timeoutMs=0), we still need an AbortController with a large
-// ceiling so that the explicit signal overrides undici's internal default.
-// 1 hour is generous; the adapter-level or Paperclip-level timeout should be
-// the real limit, not an HTTP library default.
-const MAX_FALLBACK_TIMEOUT_MS = 60 * 60 * 1000; // 1 hour
 
 function isAbortError(err: unknown): boolean {
   return (
@@ -73,14 +69,10 @@ async function fetchJson<T>(
   opts: RequestInit & { timeoutMs?: number },
 ): Promise<{ ok: boolean; status: number; data: T; raw: string }> {
   const controller = new AbortController();
-  // Always set an AbortController timeout so that the explicit signal
-  // overrides Node.js/undici's default 300s body timeout.  When the caller
-  // passes timeoutMs=0 (no limit), use a generous fallback ceiling.
-  const effectiveTimeout =
+  const timer =
     opts.timeoutMs && opts.timeoutMs > 0
-      ? opts.timeoutMs
-      : MAX_FALLBACK_TIMEOUT_MS;
-  const timer = setTimeout(() => controller.abort(), effectiveTimeout);
+      ? setTimeout(() => controller.abort(), opts.timeoutMs)
+      : null;
 
   try {
     const res = await fetch(url, {
@@ -96,14 +88,14 @@ async function fetchJson<T>(
     }
     return { ok: res.ok, status: res.status, data, raw };
   } finally {
-    clearTimeout(timer);
+    if (timer) clearTimeout(timer);
   }
 }
 
 export async function execute(
   ctx: AdapterExecutionContext,
 ): Promise<AdapterExecutionResult> {
-  const { runId, agent, runtime, config, context, onLog, onMeta, authToken: _authToken } =
+  const { runId, agent, runtime, config, context, onLog, onMeta, authToken } =
     ctx;
 
   const url = asString(config.url, "").replace(/\/+$/, "");
@@ -152,11 +144,52 @@ export async function execute(
     }
   }
 
-  // Build Paperclip env context for template rendering
+  // Build Paperclip env — same wake vars as opencode_local so the remote agent
+  // has full context even though we can't set process env vars remotely.
+  const envConfig = parseObject(config.env);
+  const hasExplicitApiKey =
+    typeof envConfig.PAPERCLIP_API_KEY === "string" && envConfig.PAPERCLIP_API_KEY.trim().length > 0;
   const env: Record<string, string> = { ...buildPaperclipEnv(agent) };
   env.PAPERCLIP_RUN_ID = runId;
+  const wakeTaskId =
+    (typeof context.taskId === "string" && context.taskId.trim().length > 0 && context.taskId.trim()) ||
+    (typeof context.issueId === "string" && context.issueId.trim().length > 0 && context.issueId.trim()) ||
+    null;
+  const wakeReason =
+    typeof context.wakeReason === "string" && context.wakeReason.trim().length > 0
+      ? context.wakeReason.trim()
+      : null;
+  const wakeCommentId =
+    (typeof context.wakeCommentId === "string" && context.wakeCommentId.trim().length > 0 && context.wakeCommentId.trim()) ||
+    (typeof context.commentId === "string" && context.commentId.trim().length > 0 && context.commentId.trim()) ||
+    null;
+  const approvalId =
+    typeof context.approvalId === "string" && context.approvalId.trim().length > 0
+      ? context.approvalId.trim()
+      : null;
+  const approvalStatus =
+    typeof context.approvalStatus === "string" && context.approvalStatus.trim().length > 0
+      ? context.approvalStatus.trim()
+      : null;
+  const linkedIssueIds = Array.isArray(context.issueIds)
+    ? context.issueIds.filter((value): value is string => typeof value === "string" && value.trim().length > 0)
+    : [];
+  const wakePayloadJson = stringifyPaperclipWakePayload(context.paperclipWake);
+  if (wakeTaskId) env.PAPERCLIP_TASK_ID = wakeTaskId;
+  if (wakeReason) env.PAPERCLIP_WAKE_REASON = wakeReason;
+  if (wakeCommentId) env.PAPERCLIP_WAKE_COMMENT_ID = wakeCommentId;
+  if (approvalId) env.PAPERCLIP_APPROVAL_ID = approvalId;
+  if (approvalStatus) env.PAPERCLIP_APPROVAL_STATUS = approvalStatus;
+  if (linkedIssueIds.length > 0) env.PAPERCLIP_LINKED_ISSUE_IDS = linkedIssueIds.join(",");
+  if (wakePayloadJson) env.PAPERCLIP_WAKE_PAYLOAD_JSON = wakePayloadJson;
+  for (const [key, value] of Object.entries(envConfig)) {
+    if (typeof value === "string") env[key] = value;
+  }
+  if (!hasExplicitApiKey && authToken) {
+    env.PAPERCLIP_API_KEY = authToken;
+  }
 
-  const renderedPrompt = renderTemplate(promptTemplate, {
+  const templateData = {
     agentId: agent.id,
     companyId: agent.companyId,
     runId,
@@ -164,8 +197,45 @@ export async function execute(
     agent,
     run: { id: runId, source: "on_demand" },
     context,
+  };
+
+  // Build prompt following the same pattern as opencode_local:
+  // instructions + bootstrap + wake prompt + handoff + rendered template.
+  // Since this is a remote adapter, we also inject env vars into the prompt
+  // so the agent has API access (PAPERCLIP_API_KEY, etc.).
+  const runtimeSessionParams = parseObject(runtime.sessionParams);
+  const hasExistingSession = asString(runtimeSessionParams.sessionId, "").length > 0;
+  const bootstrapPromptTemplate = asString(config.bootstrapPromptTemplate, "");
+  const renderedBootstrapPrompt =
+    !hasExistingSession && bootstrapPromptTemplate.trim().length > 0
+      ? renderTemplate(bootstrapPromptTemplate, templateData).trim()
+      : "";
+  const wakePrompt = renderPaperclipWakePrompt(context.paperclipWake, {
+    resumedSession: hasExistingSession,
   });
-  const prompt = `${instructionsPrefix}${renderedPrompt}`;
+  const shouldUseResumeDeltaPrompt = hasExistingSession && wakePrompt.length > 0;
+  const renderedPrompt = shouldUseResumeDeltaPrompt
+    ? ""
+    : renderTemplate(promptTemplate, templateData);
+  const sessionHandoffNote = asString(context.paperclipSessionHandoffMarkdown, "").trim();
+
+  // Inject env vars into the prompt so the remote agent has API access.
+  // Local adapters set these as process env vars; remote adapters must pass them in-band.
+  const envEntries = Object.entries(env).filter(
+    ([key]) => key.startsWith("PAPERCLIP_"),
+  );
+  const envSection = envEntries.length > 0
+    ? `## Paperclip Environment\n\nThe following environment variables are provided for this run. Use PAPERCLIP_API_KEY to authenticate API calls to PAPERCLIP_API_URL.\n\n${envEntries.map(([k, v]) => `${k}=${v}`).join("\n")}`
+    : "";
+
+  const prompt = joinPromptSections([
+    instructionsPrefix,
+    renderedBootstrapPrompt,
+    wakePrompt,
+    sessionHandoffNote,
+    envSection,
+    renderedPrompt,
+  ]);
 
   // Emit invocation metadata
   if (onMeta) {
@@ -186,7 +256,6 @@ export async function execute(
   }
 
   // Session resolution — check for existing session to resume
-  const runtimeSessionParams = parseObject(runtime.sessionParams);
   const runtimeSessionId = asString(runtimeSessionParams.sessionId, "");
   const runtimeSessionDir = asString(runtimeSessionParams.directory, "");
   const canResume =
@@ -206,14 +275,24 @@ export async function execute(
 
     // Create a new session if not resuming
     if (!sessionId) {
-      const taskKey =
-        runtime.taskKey ??
-        (typeof context.issueIdentifier === "string"
-          ? context.issueIdentifier
-          : null);
-      const sessionTitle = taskKey
-        ? `Paperclip: ${taskKey}`
-        : `Paperclip run ${runId.slice(0, 8)}`;
+      // Build a descriptive session title: "AgentName: TEC-29 — Task title"
+      const wakePayload = parseObject(context.paperclipWakePayload);
+      const wakeIssue = parseObject(wakePayload.issue);
+      const issueIdentifier =
+        asString(context.issueIdentifier, "") ||
+        asString(wakeIssue.identifier, "") ||
+        runtime.taskKey ||
+        null;
+      const issueTitle =
+        asString(context.issueTitle, "") ||
+        asString(wakeIssue.title, "") ||
+        "";
+      const agentLabel = agent.name || "Agent";
+      const sessionTitle = issueIdentifier
+        ? issueTitle
+          ? `${agentLabel}: ${issueIdentifier} — ${issueTitle}`
+          : `${agentLabel}: ${issueIdentifier}`
+        : `${agentLabel}: run ${runId.slice(0, 8)}`;
 
       await onLog(
         "stderr",
