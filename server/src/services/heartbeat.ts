@@ -2283,6 +2283,7 @@ export function heartbeatService(db: Db) {
             id: issues.id,
             identifier: issues.identifier,
             title: issues.title,
+            description: issues.description,
             status: issues.status,
             priority: issues.priority,
             projectId: issues.projectId,
@@ -2297,6 +2298,25 @@ export function heartbeatService(db: Db) {
           .where(and(eq(issues.id, issueId), eq(issues.companyId, agent.companyId)))
           .then((rows) => rows[0] ?? null)
       : null;
+    // Enrich context with human-readable issue fields so adapters can use
+    // them in prompt templates (e.g. {{context.issueIdentifier}}).
+    if (issueContext?.identifier && !readNonEmptyString(context.issueIdentifier)) {
+      context.issueIdentifier = issueContext.identifier;
+    }
+    if (issueContext?.title && !readNonEmptyString(context.issueTitle)) {
+      context.issueTitle = issueContext.title;
+    }
+    if (issueContext?.priority && !readNonEmptyString(context.issuePriority)) {
+      context.issuePriority = issueContext.priority;
+    }
+    if (issueContext?.status && !readNonEmptyString(context.issueStatus)) {
+      context.issueStatus = issueContext.status;
+    }
+    if (issueContext?.description && !readNonEmptyString(context.issueDescription)) {
+      // Truncate long descriptions to keep context size reasonable
+      const desc = issueContext.description;
+      context.issueDescription = desc.length > 4000 ? desc.slice(0, 4000) + "\n\n[description truncated]" : desc;
+    }
     const issueAssigneeOverrides =
       issueContext && issueContext.assigneeAgentId === agent.id
         ? parseIssueAssigneeAdapterOverrides(
